@@ -1,0 +1,12 @@
+{
+  "results": [
+    {
+      "component": "first",
+      "status": "ok"
+    },
+    {
+      "component": "second",
+      "status": "failed"
+    }
+  ]
+}
