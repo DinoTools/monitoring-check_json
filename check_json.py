@@ -176,7 +176,7 @@ def main():
             check_value_critical, \
             check_value_min, \
             check_value_max, \
-            check_value_uom,\
+            check_value_uom, \
             *_ = check_value_split + [""] * 5
 
         value_queries[check_value_name] = check_value_query
