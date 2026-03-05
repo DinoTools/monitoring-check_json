@@ -18,17 +18,21 @@ Examples:
 
 import argparse
 import decimal
+from html.parser import HTMLParser
 import logging
 import json
+from pathlib import Path
 from pprint import pformat
 import sys
 import textwrap
 from typing import Any, Dict
+import urllib3
 
 import jmespath
 import nagiosplugin
 import requests
 import requests.adapters
+import requests.cookies
 
 logger = logging.getLogger("nagiosplugin")
 
@@ -72,6 +76,81 @@ class NumericValue(nagiosplugin.Resource):
             )
 
 
+class SelectiveTableParser(HTMLParser):
+    def __init__(self, target_id=None, target_class=None):
+        super().__init__()
+        self.target_id = target_id
+        self.target_class = target_class
+
+        self.rows = []
+        self.current_row = []
+        self.current_cell = ""
+
+        self.in_target_table = False
+        self.in_cell = False
+
+    def handle_starttag(self, tag, attrs):
+        attrs_dict = dict(attrs)
+
+        if tag == 'table':
+            id_match = not self.target_id or attrs_dict.get('id') == self.target_id
+            class_list = attrs_dict.get("class", "").split()
+            class_match = not self.target_class or self.target_class in class_list
+
+            if id_match and class_match:
+                self.in_target_table = True
+
+        if self.in_target_table:
+            if tag in ('td', 'th'):
+                self.in_cell = True
+                self.current_cell = ""
+            elif tag == 'tr':
+                self.current_row = []
+
+    def handle_data(self, data):
+        if self.in_target_table and self.in_cell:
+            self.current_cell += data.strip()
+
+    def handle_endtag(self, tag):
+        if tag == 'table' and self.in_target_table:
+            self.in_target_table = False
+        elif self.in_target_table:
+            if tag in ('td', 'th'):
+                self.current_row.append(self.current_cell.strip())
+                self.in_cell = False
+            elif tag == 'tr':
+                if self.current_row:
+                    self.rows.append(self.current_row)
+
+
+def save_cookies(session: requests.Session, filename: Path):
+    logger.debug(f"Saving cookie date to: {filename}")
+    with filename.open("w") as f:
+        cookie_dict = requests.utils.dict_from_cookiejar(session.cookies)
+        json.dump(cookie_dict, f)
+
+
+def table_to_json(html_content, table_id=None, table_class=None, table_key_index=0, table_value_index=1):
+    parser = SelectiveTableParser(target_id=table_id, target_class=table_class)
+    parser.feed(html_content)
+    results = {}
+    for row in parser.rows:
+        results[row[table_key_index]] = row[table_value_index]
+
+    return results
+
+
+def load_cookies(session: requests.Session, filename: Path):
+    if filename.exists():
+        logger.debug(f"Loading cookie date from: {filename}")
+        with filename.open("r") as f:
+            try:
+                cookie_dict = json.load(f)
+                session.cookies.update(requests.utils.cookiejar_from_dict(cookie_dict))
+            except json.JSONDecodeError:
+                pass
+
+
 @nagiosplugin.guarded()
 def main():
     argp = argparse.ArgumentParser(
@@ -85,6 +164,79 @@ def main():
         dest="url",
         help="URL of the JSON API",
         metavar="URL",
+    )
+
+    argp.add_argument(
+        "--cookie-file",
+        dest="cookie_file",
+        default=None,
+        help="Path to save/load cookies",
+    )
+
+    argp.add_argument(
+        "--login-url",
+        dest="login_url",
+        help="URL to perform a login (optional)",
+    )
+    argp.add_argument(
+        "--login-check-url",
+        dest="login_check_url",
+        help="URL to check if we are logged in (optional)",
+    )
+    argp.add_argument(
+        "--username",
+        dest="username",
+        help="Login username",
+    )
+    argp.add_argument(
+        "--password",
+        dest="password",
+        help="Login password",
+    )
+    argp.add_argument(
+        "--timeout",
+        type=int,
+        default=10,
+        help="Timeout in seconds (Default: 10)",
+    )
+    argp.add_argument(
+        "--insecure",
+        action="store_false",
+        dest="verify",
+        default=True,
+        help="Ignore SSL certificate",
+    )
+
+    argp.add_argument(
+        "--parse-html-table",
+        action="store_true",
+        dest="parse_html_table",
+        default=False,
+        help="If the API returns a HTML table with value, we can parse it",
+    )
+    argp.add_argument(
+        "--select-html-table-id",
+        dest="html_table_id",
+        help=""
+    )
+    argp.add_argument(
+        "--select-html-table-class",
+        dest="html_table_class",
+        help=""
+    )
+    argp.add_argument(
+        "--html-table-key-index",
+        dest="html_table_key_index",
+        type=int,
+        default=0,
+        help=""
+    )
+    argp.add_argument(
+        "--html-table-value-index",
+        dest="html_table_value_index",
+        type=int,
+        default=1,
+        help=""
     )
 
     argp.add_argument(
@@ -125,10 +277,66 @@ def main():
 
     check = nagiosplugin.Check()
 
+    cookie_file: None | Path = None
+    if args.cookie_file:
+        cookie_file = Path(args.cookie_file)
+
     if args.url:
         req_session = requests.Session()
-        res = req_session.get(args.url)
-        data = res.json(parse_float=decimal.Decimal)
+        req_session.cookies = requests.cookies.RequestsCookieJar()
+        req_session.verify = args.verify
+        # ToDo: enable if in debug mode
+        urllib3.disable_warnings()
+
+        if cookie_file:
+            load_cookies(req_session, cookie_file)
+
+        login_check_successfull = None
+        if args.login_check_url:
+            logger.debug("Performing login check ...")
+            login_check_res = req_session.get(args.login_check_url, timeout=args.timeout)
+            if login_check_res.status_code == 200:
+                login_check_successfull = True
+            else:
+                login_check_successfull = False
+            logger.debug(f"Login check was {'' if login_check_successfull else 'not '}successfull")
+
+        if not login_check_successfull and args.login_url:
+            logger.debug("Performing login ...")
+            auth = (args.username, args.password) if args.username else None
+            login_res = req_session.get(args.login_url, auth=auth, timeout=args.timeout)
+            if login_res.status_code != 200:
+                logger.debug(
+                    "Login not successfull. "
+                    f"code={login_res.status_code} "
+                    f"reason={login_res.reason}"
+                )
+                check.results.add(
+                    nagiosplugin.Result(
+                        state=nagiosplugin.Unknown,
+                        hint="Unable to login"
+                    )
+                )
+                check.main(verbose=args.verbose)
+            logger.debug("Login successfull")
+
+        logger.debug(f"Fetching data from {args.url}")
+        res = req_session.get(args.url, timeout=args.timeout)
+        if args.parse_html_table:
+            logger.debug("Converting table to JSON")
+            data = table_to_json(
+                res.text,
+                table_id=args.html_table_id,
+                table_class=args.html_table_class,
+                table_key_index=args.html_table_key_index,
+                table_value_index=args.html_table_value_index,
+            )
+        else:
+            logger.debug("Parsing response as JSON")
+            data = res.json(parse_float=decimal.Decimal)
+
+        if cookie_file:
+            save_cookies(req_session, cookie_file)
     elif args.filename:
         data = json.load(open(args.filename, "r"))
     else:
